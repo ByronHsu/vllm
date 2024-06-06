@@ -14,7 +14,61 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# https://github.com/vllm-project/vllm/pull/2979/files#diff-2c7d4655ba57d91833c033c89b8ee4da56772ee1a4dd6ec6c02eecc849d7e035R49
+# BLOCK_SIZE_M: (16, 32, 64, 128, 256)
+# BLOCK_SIZE_N: (16, 32, 64, 128, 256)
+# BLOCK_SIZE_K: (16, 32, 64, 128, 256)
+# GROUP_SIZE_M: (1, 2, 4, 8, 16, 32)
+# num_warps: (4, 8, 16, 32)
+# num_stage: (4)
 
+def get_triton_config():
+    l = []
+    for BLOCK_SIZE_M in [32, 64, 128, 256]:
+        for BLOCK_SIZE_N in [32, 64, 128, 256]:
+            for BLOCK_SIZE_K in [32, 64, 128, 256]:
+                for GROUP_SIZE_M in [4, 8, 16, 32]:
+                    for num_warps in [4, 8, 16, 32]:
+                        for num_stages in [2, 3, 4, 5]:
+                            l.append(
+                                triton.Config(kwargs={"BLOCK_SIZE_M": BLOCK_SIZE_M, "BLOCK_SIZE_N": BLOCK_SIZE_N, "BLOCK_SIZE_K": BLOCK_SIZE_K, "GROUP_SIZE_M": GROUP_SIZE_M}, num_warps=num_warps, num_stages=num_stages)
+                            )
+    return l
+    
+        # "BLOCK_SIZE_M": 16,
+        # "BLOCK_SIZE_N": 64,
+        # "BLOCK_SIZE_K": 256,
+        # "GROUP_SIZE_M": 32,
+        # "num_warps": 4,
+        # "num_stages": 4
+
+    # "4096": {
+    #     "BLOCK_SIZE_M": 128,
+    #     "BLOCK_SIZE_N": 128,
+    #     "BLOCK_SIZE_K": 64,
+    #     "GROUP_SIZE_M": 16,
+    #     "num_warps": 8,
+    #     "num_stages": 4
+    # }
+
+@triton.autotune(
+    # configs=get_triton_config(),
+    configs = [
+        # triton.Config(kwargs={"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16}, num_warps=32, num_stages=4),
+        # triton.Config(kwargs={"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16}, num_warps=4, num_stages=4),
+        # triton.Config(kwargs={"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16}, num_warps=8, num_stages=4),
+        triton.Config(kwargs={"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16}, num_warps=8, num_stages=4),
+        triton.Config(kwargs={"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16}, num_warps=8, num_stages=4),
+        # triton.Config(kwargs={"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16}, num_warps=4, num_stages=4),
+        # triton.Config(kwargs={"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16}, num_warps=8, num_stages=5),
+        # triton.Config(kwargs={"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16}, num_warps=8, num_stages=5),
+        # triton.Config(kwargs={"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16}, num_warps=8, num_stages=4),
+        # triton.Config(kwargs={"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16}, num_warps=8, num_stages=4),
+        # triton.Config(kwargs={"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 32}, num_warps=8, num_stages=4),
+        # triton.Config(kwargs={"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32}, num_warps=8, num_stages=3),
+    ],
+    key=["N", "K", "EM"]
+)
 @triton.jit
 def fused_moe_kernel(
     # Pointers to matrices
@@ -243,6 +297,8 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
     grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META[
         'BLOCK_SIZE_M']) * triton.cdiv(B.shape[1], META['BLOCK_SIZE_N']), )
 
+    # print(config)
+    
     fused_moe_kernel[grid](
         A,
         B,
@@ -268,7 +324,7 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
         top_k=top_k,
         compute_type=compute_type,
         use_fp8=use_fp8,
-        **config,
+        # **config,
     )
 
 

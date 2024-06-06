@@ -21,8 +21,9 @@ def benchmark_config(
     topk: int,
     dtype: torch.dtype,
     use_fp8: bool,
-    num_iters: int = 100,
+    num_iters: int = 10,
 ) -> float:
+    print(f"Running with config: {config}")
     init_dtype = torch.float16 if use_fp8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     w1 = torch.randn(num_experts,
@@ -113,11 +114,11 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
     # prune the search space.
     configs = []
     for num_stages in [2, 3, 4, 5]:
-        for block_m in [16, 32, 64, 128, 256]:
+        for block_m in [64, 128, 256]:
             for block_k in [64, 128, 256]:
-                for block_n in [32, 64, 128, 256]:
+                for block_n in [64, 128, 256]:
                     for num_warps in [4, 8]:
-                        for group_size in [1, 16, 32, 64]:
+                        for group_size in [4, 8, 16, 32, 64]:
                             configs.append({
                                 "BLOCK_SIZE_M": block_m,
                                 "BLOCK_SIZE_N": block_n,
@@ -190,7 +191,8 @@ class BenchmarkWorker:
                                                dtype,
                                                use_fp8,
                                                num_iters=10)
-            except triton.runtime.autotuner.OutOfResources:
+            except Exception as e:
+                print(f"Got exception {e}")
                 # Some configurations may be invalid and fail to compile.
                 continue
 
