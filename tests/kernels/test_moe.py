@@ -106,29 +106,39 @@ def test_mixtral_moe(dtype: torch.dtype):
 import triton
 
 
+from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
+
+
+class MixtralFastMoeBlock(MixtralSparseMoeBlock):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # import pdb; pdb.set_trace()
+        expert_layer = self.experts[0]
+        return expert_layer(hidden_states)
+
+
 @triton.testing.perf_report(
     [
+        # triton.testing.Benchmark(
+        #     x_names=["bsz"],
+        #     x_vals=[i for i in range(4, 8, 2)],
+        #     line_arg="provider",
+        #     line_vals=["vllm", "hf", "fast"],
+        #     line_names=["vLLM", "HF", "Fast"],
+        #     styles=[("blue", "-"), ("green", "-"), ("orange", "-")],
+        #     ylabel="time (ms)",
+        #     plot_name=f"moe-fp32-speed-benchmark",
+        #     args={"seq_len": 4096, "hidden_size": 4096, "intermediate_size": 14336, "num_local_experts": 8, "num_experts_per_tok": 2, "dtype": torch.float32},
+        # ),
         triton.testing.Benchmark(
             x_names=["bsz"],
-            x_vals=[2**i for i in range(2, 8)],
+            x_vals=[i for i in range(4, 8, 2)],
             line_arg="provider",
-            line_vals=["vllm", "hf"],
-            line_names=["vLLM", "HF"],
-            styles=[("blue", "-"), ("green", "-")],
-            ylabel="time (ms)",
-            plot_name=f"moe-fp32-speed-benchmark",
-            args={"seq_len": 256, "hidden_size": 4096, "intermediate_size": 14336, "num_local_experts": 8, "num_experts_per_tok": 2, "dtype": torch.float32},
-        ),
-        triton.testing.Benchmark(
-            x_names=["bsz"],
-            x_vals=[2**i for i in range(2, 8)],
-            line_arg="provider",
-            line_vals=["vllm", "hf"],
-            line_names=["vLLM", "HF"],
-            styles=[("blue", "-"), ("green", "-")],
+            line_vals=["vllm", "hf", "fast"],
+            line_names=["vLLM", "HF", "Fast"],
+            styles=[("blue", "-"), ("green", "-"), ("orange", "-")],
             ylabel="time (ms)",
             plot_name=f"moe-bf16-speed-benchmark",
-            args={"seq_len": 256, "hidden_size": 4096, "intermediate_size": 7168 * 2, "num_local_experts": 8, "num_experts_per_tok": 2, "dtype": torch.bfloat16},
+            args={"seq_len": 4096, "hidden_size": 4096, "intermediate_size": 14336, "num_local_experts": 8, "num_experts_per_tok": 2, "dtype": torch.bfloat16},
         ),
         # triton.testing.Benchmark(
         #     x_names=["bsz"],
@@ -162,26 +172,33 @@ def bench_speed_moe(bsz, seq_len, hidden_size, intermediate_size, num_local_expe
             params_dtype=dtype,
             tp_size=1,
         ).to(dtype).to("cuda")
+        moe_block.gate.weight.data = torch.randn_like(moe_block.gate.weight.data)
     elif provider == "hf":
         moe_block = MixtralSparseMoeBlock(config).to(dtype).to("cuda")
+        moe_block.gate.weight.data = torch.randn_like(moe_block.gate.weight.data)
+    elif provider == "fast":
+        moe_block = MixtralFastMoeBlock(config).to(dtype).to("cuda")
+        moe_block.gate.weight.data = torch.randn_like(moe_block.gate.weight.data)
     else:
         raise ValueError(f"Invalid provider: {provider} for MoE block")
 
-    x = torch.randn(bsz, seq_len, hidden_size, device="cuda", dtype=dtype)
-    dy = torch.randn_like(x)
+    
 
     quantiles = [0.5, 0.2, 0.8]
 
     def fwd():
+        x = torch.randn(bsz, seq_len, hidden_size, device="cuda", dtype=dtype)
         if provider == "vllm":
             moe_block(x.view(bsz*seq_len, -1))
         elif provider == "hf":
+            moe_block(x)
+        elif provider == "fast":
             moe_block(x)
         else:
             raise ValueError(f"Invalid provider: {provider} for MoE block")
 
     ms, min_ms, max_ms = triton.testing.do_bench(
-        fwd, quantiles=quantiles, grad_to_none=[x], warmup=2, rep=4
+        fwd, quantiles=quantiles, warmup=2, rep=4
     )
 
     return ms, max_ms, min_ms
@@ -271,3 +288,72 @@ def test_bench_memory_moe_wrapper():
     output_dir = "./moe_memory"
     os.makedirs(output_dir, exist_ok=True)
     bench_memory_moe.run(save_path=output_dir, print_data=True)
+
+
+def test_profiler():
+    hidden_size, intermediate_size, num_local_experts, num_experts_per_tok = 4096, 14336, 8, 2
+    bsz, seq_len = 4, 2048
+    dtype = torch.float32
+
+    config = MixtralConfig(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_local_experts=num_local_experts,
+        num_experts_per_tok=num_experts_per_tok,
+    )
+    from liger.callbacks.profiler import trace_handler
+
+    prof = torch.profiler.profile(
+        schedule=torch.profiler.schedule(
+            wait=0, warmup=2, active=2, repeat=1, skip_first=0
+        ),
+        on_trace_ready=trace_handler("./prof"),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+    )
+
+    vllm_moe = MixtralMoE(
+        num_experts=config.num_local_experts,
+        top_k=config.num_experts_per_tok,
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        params_dtype=dtype,
+        tp_size=1,
+    ).to(dtype).to("cuda")
+    vllm_moe.gate.weight.data = torch.randn_like(vllm_moe.gate.weight.data)
+
+    hf_moe = MixtralSparseMoeBlock(config).to(dtype).to("cuda")
+    hf_moe.gate.weight.data = torch.randn_like(hf_moe.gate.weight.data)
+
+    fast_moe = MixtralFastMoeBlock(config).to(dtype).to("cuda")
+    fast_moe.gate.weight.data = torch.randn_like(fast_moe.gate.weight.data)
+
+    
+
+    # import pdb; pdb.set_trace()
+
+    prof.start()
+    import time
+
+    for _ in range(4):
+
+        _tensor = torch.randn(bsz, seq_len, hidden_size, device="cuda", dtype=dtype)
+
+        torch.cuda.synchronize()
+        prof.step()
+        vllm_moe(_tensor.view(bsz*seq_len, -1))
+        torch.cuda.synchronize()
+        time.sleep(0.5)
+
+        _tensor = torch.randn(bsz, seq_len, hidden_size, device="cuda", dtype=dtype)
+
+        hf_moe(_tensor)
+        torch.cuda.synchronize()
+        time.sleep(0.5)
+
+        _tensor = torch.randn(bsz, seq_len, hidden_size, device="cuda", dtype=dtype)
+
+        fast_moe(_tensor)
+        torch.cuda.synchronize()
+        time.sleep(0.5)
